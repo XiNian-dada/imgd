@@ -2,10 +2,7 @@ name: Build Linux amd64 Package
 
 on:
   push:
-    branches:
-      - main
-    tags:
-      - 'v*'
+    branches: [ main ]
   workflow_dispatch:
 
 permissions:
@@ -14,7 +11,6 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-
     env:
       CARGO_TERM_COLOR: always
       BIN_NAME: imgd
@@ -23,6 +19,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 需要推 tag
 
       - name: Verify runner architecture
         run: |
@@ -53,27 +51,25 @@ jobs:
           cd dist
           zip -r ${ARTIFACT_NAME}.zip ${ARTIFACT_NAME}
 
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: imgd-linux-amd64.zip
-          path: dist/${{ env.ARTIFACT_NAME }}
-          if-no-files-found: error
+      # 关键：把 latest tag 强制指向本次提交
+      - name: Update latest tag (force)
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -f latest
+          git push -f origin latest
 
-      - name: Publish latest prerelease (main)
-        if: github.ref == 'refs/heads/main'
-        uses: softprops/action-gh-release@v2
+      # 关键：发布/更新 latest Release，并替换旧附件（只保留最新）
+      - name: Publish latest Release (only keep newest asset)
+        uses: ncipollo/release-action@v1
         with:
-          tag_name: latest
-          target_commitish: main
+          tag: latest
           name: Latest Build
           prerelease: true
-          files: dist/${{ env.ARTIFACT_NAME }}.zip
-          overwrite_files: true
-
-      - name: Attach zip to GitHub Release (version tag)
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/${{ env.ARTIFACT_NAME }}.zip
-          overwrite_files: true
+          artifacts: dist/${{ env.ARTIFACT_NAME }}.zip
+          replacesArtifacts: true
+          allowUpdates: true
+          artifactErrorsFailBuild: true
+          body: |
+            Auto-built from main.
+            Commit: ${{ github.sha }}

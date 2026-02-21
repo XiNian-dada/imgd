@@ -1,257 +1,295 @@
 # imgd
 
-一个自用的极简图床上传后端：
-- Nginx 负责静态文件直出
-- Rust (axum + tokio) 只负责上传 API
+Minimal image-host upload backend:
+- `imgd` handles upload API only (`/upload`)
+- Nginx serves static files (`/images/...`)
 
-## 功能
+---
 
-- `POST /upload`（`multipart/form-data`，字段名必须为 `file`）
-- 鉴权：
-  - `X-Upload-Token: <token>`
-  - 或 `Authorization: Bearer <token>`
-- 仅允许 WebP：
-  - 扩展名必须是 `.webp`
-  - 文件头必须匹配 `RIFF....WEBP`
-- 上传大小限制：单文件最大 5MB（流式读取过程中截断）
-- 流式写盘：避免整文件读入内存
-- 内容哈希命名：`/data/images/YYYY/MM/<sha256>.webp`
-- 去重：同内容二次上传不重复落盘
-- 基础抗滥用：
-  - 每 IP 简易限流
-  - 并发上传闸门（Semaphore）
-- 可观测：
-  - tracing 结构化日志（ip/request_id/sha256/size/elapsed/result）
-  - `GET /healthz` 返回 `ok`
-  - `GET /metrics` 返回计数（成功/失败/限流）
+## English
 
-## 环境变量
+### 1) Quick Deploy (on server)
 
-- `PORT`：监听端口，默认 `3000`
-- `UPLOAD_TOKEN`：上传 token（可选，兼容旧模式；推荐使用 `TOKENS_FILE` 多 token）
-- `TOKENS_FILE`：token 配置文件路径（推荐）
-- `PUBLIC_BASE_URL`：公网图片前缀，例如 `https://img.example.com/images`（必填）
-- `DATA_DIR`：图片根目录，默认 `/data/images`
-- `MAX_CONCURRENT_UPLOADS`：最大并发上传数，默认 `16`
-- `RATE_LIMIT_PER_MINUTE`：每 IP 每分钟请求上限，默认 `60`
-- `RUST_LOG`：日志级别（例如 `imgd=info,tower_http=info`）
-
-## 本地运行
+Download and extract `imgd-linux-amd64.zip` from GitHub Release, then run:
 
 ```bash
-PORT=3000 \
-UPLOAD_TOKEN=secret \
-PUBLIC_BASE_URL=https://img.example.com/images \
-DATA_DIR=/data/images \
-cargo run
+chmod +x ./imgd ./install.sh
+sudo ./install.sh --bin ./imgd
 ```
 
-启动时会自动：
-- 创建 `DATA_DIR`
-- 创建 `DATA_DIR/.tmp`
-- 检查写权限（不可写直接启动失败）
-
-## API
-
-### `POST /upload`
-
-请求：
-- `multipart/form-data`
-- 字段名：`file`
-
-成功响应：
-
-```json
-{
-  "url": "https://img.example.com/images/2026/02/<sha256>.webp",
-  "path": "/2026/02/<sha256>.webp",
-  "sha256": "...",
-  "size": 12345
-}
-```
-
-失败响应格式：
-
-```json
-{
-  "error": "unauthorized|unsupported_media_type|file_too_large|bad_request|too_many_requests|internal_error"
-}
-```
-
-## 手工验收
-
-### 1) 健康检查
-
-```bash
-curl http://127.0.0.1:3000/healthz
-```
-
-### 2) 上传一张 WebP
-
-```bash
-curl -H "X-Upload-Token: secret" \
-  -F "file=@/path/to/a.webp" \
-  http://127.0.0.1:3000/upload
-```
-
-### 3) 重复上传同一文件（验证去重）
-
-再次上传同文件，返回 `sha256/path` 应一致。
-
-### 4) 伪装 WebP（应 415）
-
-```bash
-printf 'hello' > /tmp/fake.webp
-curl -H "X-Upload-Token: secret" \
-  -F "file=@/tmp/fake.webp" \
-  http://127.0.0.1:3000/upload
-```
-
-### 5) 超大文件（应 413）
-
-上传 >5MB 文件，返回 `file_too_large`。
-
-### 6) 连续请求（应触发 429）
-
-```bash
-seq 1 100 | xargs -P 32 -I{} \
-  curl -s -o /dev/null -w "%{http_code}\n" \
-  -H "X-Upload-Token: secret" \
-  -F "file=@/path/to/a.webp" \
-  http://127.0.0.1:3000/upload | sort | uniq -c
-```
-
-## 生产部署（Ubuntu x86_64）
-
-你说得对，部署应该是“二进制到服务器后，全在服务器执行”。
-
-已提供一键脚本：`deploy/install.sh`（交互式）。
-
-CI 产物说明：
-- Actions 工件名称：`imgd-linux-amd64.zip`（下载后可直接解压，内含 `imgd` 和 `install.sh`）
-- Release 资产名称：`imgd-linux-amd64.zip`（`main` 更新 `latest`，`v*` tag 发布正式版）
-
-### 1) 准备文件（在服务器上）
-
-确保服务器上有这两个文件：
-- `imgd`（Linux x86_64 二进制）
-- `deploy/install.sh`
-
-给执行权限：
-
-```bash
-chmod +x ./imgd ./deploy/install.sh
-```
-
-### 2) 一键部署（在服务器上）
-
-```bash
-sudo ./deploy/install.sh --bin ./imgd
-```
-
-脚本会逐项询问：
-- 域名
-- 端口
-- 存储目录
-- systemd 服务用户
-- 限流/并发等关键配置
-
-直接回车会使用默认值，其中端口默认是“随机可用四位数端口”。
-
-脚本会自动完成：
-- 创建/复用系统用户 `imgd`
-- 安装并配置 Nginx（可选，自动从 `nginx -V` 识别 prefix/conf-path，并写入已 include 的配置目录）
-- 安装二进制到 `/opt/imgd/bin/imgd`
-- 生成 `/opt/imgd/conf/imgd.env`
-- 创建 systemd 服务 `/etc/systemd/system/imgd.service`
-- 创建静态目录 `/data/images` 与临时目录 `/data/images/.tmp`
-- 启动并设置开机自启 `imgd`
-- 重载 Nginx
-
-### 3) 验收
-
-```bash
-PORT=$(grep '^PORT=' /opt/imgd/conf/imgd.env | cut -d= -f2)
-curl -i "http://127.0.0.1:${PORT}/healthz"
-curl -i -H "X-Upload-Token: <your-token>" \
-  -F "file=@/path/to/a.webp" \
-  http://img.example.com/upload
-```
-
-### 4) 常用参数
-
-```bash
-# 自定义端口、数据目录、限流
-sudo ./deploy/install.sh \
-  --domain img.example.com \
-  --bin ./imgd \
-  --port 3000 \
-  --data-dir /data/images \
-  --max-concurrent 16 \
-  --rate-limit 60
-
-# 只部署后端，不改 Nginx
-sudo ./deploy/install.sh --domain img.example.com --bin ./imgd --skip-nginx
-
-# 仅写配置，不立即启动
-sudo ./deploy/install.sh --domain img.example.com --bin ./imgd --no-enable
-
-# 禁用交互（CI/脚本场景）
-sudo ./deploy/install.sh --non-interactive --domain img.example.com --bin ./imgd
-```
-
-### 5) 更新版本
-
-把新二进制覆盖到服务器后，重复执行同一条安装命令即可（幂等）。
-
-### 6) 日志与状态
+After install:
 
 ```bash
 sudo systemctl status imgd --no-pager
-sudo journalctl -u imgd -f
+PORT=$(grep '^PORT=' /opt/imgd/conf/imgd.env | cut -d= -f2)
+curl -i "http://127.0.0.1:${PORT}/healthz"
 ```
 
-### 7) Token 管理（新增）
+### 2) What `install.sh` does
 
-服务支持通过命令生成多个 token，并可单独控制过期时间与频率限制。
+The installer is interactive (press Enter to accept defaults). It performs these steps:
+
+1. Checks Nginx availability.
+What it means: if Nginx is missing and you did not use `--skip-nginx`, it installs Nginx.
+
+2. Installs binary to `/opt/imgd/bin/imgd`.
+What it means: this is the managed runtime path used by systemd.
+
+3. Prepares storage directories.
+What it means: creates image root and temporary upload dir, and applies ownership/permissions.
+
+4. Writes runtime config `/opt/imgd/conf/imgd.env`.
+What it means: stores `PORT`, `PUBLIC_BASE_URL`, `DATA_DIR`, `TOKENS_FILE`, and limits.
+
+5. Initializes token store `/opt/imgd/conf/tokens.json`.
+What it means: multi-token auth source used by the service.
+
+6. Writes systemd unit `/etc/systemd/system/imgd.service`.
+What it means: service is managed by `systemctl` (start/restart/enable/logs).
+
+7. Detects real Nginx config layout from `nginx -V` and `nginx.conf` includes.
+What it means: supports package Nginx and panel/custom Nginx layouts.
+
+8. Writes `imgd` Nginx server config to detected include directory.
+What it means: enables `/images/` static mapping and `/upload` reverse proxy.
+
+9. Validates Nginx (`nginx -t`) and applies reload.
+What it means: config must pass syntax check before going live.
+
+10. Optionally creates initial token (if none) and starts service.
+What it means: service becomes usable immediately.
+
+### 3) Create Tokens
 
 ```bash
-# 生成一个 token：30 天过期，每分钟最多 120 次上传
+# Never-expire token
+/opt/imgd/bin/imgd token create --name default --never-expire --tokens-file /opt/imgd/conf/tokens.json
+
+# 30-day token with per-token limit
 /opt/imgd/bin/imgd token create --name mobile --days 30 --rate-limit 120 --tokens-file /opt/imgd/conf/tokens.json
 
-# 生成一个永不过期 token（不设独立限流，继承全局 RATE_LIMIT_PER_MINUTE）
-/opt/imgd/bin/imgd token create --name ci --never-expire --tokens-file /opt/imgd/conf/tokens.json
-
-# 按 RFC3339 指定过期时间
-/opt/imgd/bin/imgd token create --name temp --expires-at 2026-12-31T23:59:59Z --rate-limit 30 --tokens-file /opt/imgd/conf/tokens.json
-
-# 查看 token（展示 name/过期/限流/token_id，不直接泄露 token）
+# List tokens
 /opt/imgd/bin/imgd token list --tokens-file /opt/imgd/conf/tokens.json
 
-# 撤销 token（按 name 或原始 token）
+# Revoke token
 /opt/imgd/bin/imgd token revoke --name mobile --tokens-file /opt/imgd/conf/tokens.json
 ```
 
-修改 token 后重启服务生效：
+Apply token changes:
 
 ```bash
 sudo systemctl restart imgd
 ```
 
-## 国内 crates 镜像（已配置清华源）
+### 4) Upload Test
 
-项目内 `.cargo/config.toml`：
-
-```toml
-[source.crates-io]
-replace-with = "tuna"
-
-[source.tuna]
-registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"
+```bash
+curl -i \
+  -H "X-Upload-Token: <your-token>" \
+  -F "file=@/path/to/1.webp" \
+  http://<your-domain>/upload
 ```
 
-如你更偏好阿里源，可改为：
+Expected success fields: `url`, `path`, `sha256`, `size`.
 
-```toml
-registry = "sparse+https://mirrors.aliyun.com/crates.io-index/"
+### 5) Common Issues
+
+#### A) `sendfile directive is not allowed here .../tcp/imgd.conf`
+Cause: an old/incorrect config was written under TCP/stream include path.
+
+Fix:
+
+```bash
+sudo rm -f /path/to/nginx/tcp/imgd.conf
+sudo nginx -t && sudo nginx -s reload
 ```
+
+#### B) Upload succeeds but image returns 404
+Checklist:
+
+```bash
+# 1) file exists
+ls -l /data/images/YYYY/MM/<sha256>.webp
+
+# 2) force host match
+curl -I -H "Host: <your-domain>" http://127.0.0.1/images/YYYY/MM/<sha256>.webp
+
+# 3) confirm nginx user
+grep -n '^user' <nginx.conf>
+
+# 4) directory traversal/read permissions
+sudo chmod 755 /data
+sudo find /data/images -type d -exec chmod 750 {} \;
+sudo find /data/images -type f -exec chmod 640 {} \;
+
+# 5) reload
+sudo nginx -t && sudo nginx -s reload
+```
+
+#### C) returned URL contains `0.0.0.0`
+Cause: `PUBLIC_BASE_URL` is incorrect.
+
+Fix:
+
+```bash
+sudo sed -i 's|^PUBLIC_BASE_URL=.*|PUBLIC_BASE_URL=http://<your-domain>/images|' /opt/imgd/conf/imgd.env
+sudo systemctl restart imgd
+```
+
+#### D) HTTPS certificate mismatch
+Cause: certificate does not include your image domain.
+
+Fix:
+- Issue/bind a valid certificate for your domain.
+- Use `http://` as temporary `PUBLIC_BASE_URL` until TLS is fixed.
+
+### 6) CI/CD Artifacts
+
+- Actions artifact: `imgd-linux-amd64.zip`
+- Release asset: `imgd-linux-amd64.zip`
+- `main` updates `latest` prerelease, `v*` tags publish versioned release
+
+---
+
+## 中文
+
+### 1) 快速部署（在服务器上）
+
+从 GitHub Release 下载并解压 `imgd-linux-amd64.zip`，执行：
+
+```bash
+chmod +x ./imgd ./install.sh
+sudo ./install.sh --bin ./imgd
+```
+
+安装后检查：
+
+```bash
+sudo systemctl status imgd --no-pager
+PORT=$(grep '^PORT=' /opt/imgd/conf/imgd.env | cut -d= -f2)
+curl -i "http://127.0.0.1:${PORT}/healthz"
+```
+
+### 2) `install.sh` 每一步在做什么
+
+脚本是交互式的（直接回车用默认值），核心步骤如下：
+
+1. 检查 Nginx 是否可用。
+含义：若未安装且未加 `--skip-nginx`，会自动安装。
+
+2. 把二进制安装到 `/opt/imgd/bin/imgd`。
+含义：systemd 固定从这里启动服务。
+
+3. 创建并初始化存储目录。
+含义：准备图片目录和临时上传目录，并设置权限。
+
+4. 写入 `/opt/imgd/conf/imgd.env`。
+含义：写入端口、公开 URL、数据目录、token 文件、限流参数等。
+
+5. 初始化 `/opt/imgd/conf/tokens.json`。
+含义：多 token 鉴权的数据来源。
+
+6. 生成 systemd 服务文件。
+含义：后续可用 `systemctl` 管理（启动/重启/开机自启/日志）。
+
+7. 通过 `nginx -V` + `nginx.conf include` 自动识别 Nginx 配置布局。
+含义：兼容系统包安装和面板/自编译路径。
+
+8. 把 `imgd` 的 Nginx 配置写到正确 include 目录。
+含义：启用 `/images/` 静态和 `/upload` 反代。
+
+9. 执行 `nginx -t` 校验并重载。
+含义：配置无语法错误才会生效。
+
+10. 若无 token，则引导创建首个 token，并启动服务。
+含义：安装完成即可直接上传。
+
+### 3) 创建 Token
+
+```bash
+# 永不过期
+/opt/imgd/bin/imgd token create --name default --never-expire --tokens-file /opt/imgd/conf/tokens.json
+
+# 30 天过期 + 每分钟 120 次
+/opt/imgd/bin/imgd token create --name mobile --days 30 --rate-limit 120 --tokens-file /opt/imgd/conf/tokens.json
+
+# 查看
+/opt/imgd/bin/imgd token list --tokens-file /opt/imgd/conf/tokens.json
+
+# 吊销
+/opt/imgd/bin/imgd token revoke --name mobile --tokens-file /opt/imgd/conf/tokens.json
+```
+
+修改 token 后：
+
+```bash
+sudo systemctl restart imgd
+```
+
+### 4) 上传测试
+
+```bash
+curl -i \
+  -H "X-Upload-Token: <你的token>" \
+  -F "file=@/path/to/1.webp" \
+  http://<你的域名>/upload
+```
+
+成功返回字段：`url`、`path`、`sha256`、`size`。
+
+### 5) 常见问题
+
+#### A) `sendfile directive is not allowed here .../tcp/imgd.conf`
+原因：错误配置曾写入了 tcp/stream 目录。
+
+处理：
+
+```bash
+sudo rm -f /path/to/nginx/tcp/imgd.conf
+sudo nginx -t && sudo nginx -s reload
+```
+
+#### B) 上传成功但图片 404
+排查顺序：
+
+```bash
+# 1) 文件是否存在
+ls -l /data/images/YYYY/MM/<sha256>.webp
+
+# 2) 强制 Host 命中对应站点
+curl -I -H "Host: <你的域名>" http://127.0.0.1/images/YYYY/MM/<sha256>.webp
+
+# 3) 查看 nginx 运行用户
+grep -n '^user' <nginx.conf>
+
+# 4) 确保可遍历/可读
+sudo chmod 755 /data
+sudo find /data/images -type d -exec chmod 750 {} \;
+sudo find /data/images -type f -exec chmod 640 {} \;
+
+# 5) 重载
+sudo nginx -t && sudo nginx -s reload
+```
+
+#### C) 返回 URL 是 `0.0.0.0`
+原因：`PUBLIC_BASE_URL` 配错。
+
+处理：
+
+```bash
+sudo sed -i 's|^PUBLIC_BASE_URL=.*|PUBLIC_BASE_URL=http://<你的域名>/images|' /opt/imgd/conf/imgd.env
+sudo systemctl restart imgd
+```
+
+#### D) HTTPS 证书不匹配
+原因：证书没有覆盖你的图片域名。
+
+处理：
+- 给该域名签发并绑定正确证书
+- 证书修好前先用 `http://` 作为 `PUBLIC_BASE_URL`
+
+### 6) CI/CD 产物
+
+- Actions 工件：`imgd-linux-amd64.zip`
+- Release 资产：`imgd-linux-amd64.zip`
+- `main` 自动更新 `latest` 预发布，`v*` tag 发布版本 Release
