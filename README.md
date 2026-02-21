@@ -28,7 +28,8 @@
 ## 环境变量
 
 - `PORT`：监听端口，默认 `3000`
-- `UPLOAD_TOKEN`：上传 token（必填）
+- `UPLOAD_TOKEN`：上传 token（可选，兼容旧模式；推荐使用 `TOKENS_FILE` 多 token）
+- `TOKENS_FILE`：token 配置文件路径（推荐）
 - `PUBLIC_BASE_URL`：公网图片前缀，例如 `https://img.example.com/images`（必填）
 - `DATA_DIR`：图片根目录，默认 `/data/images`
 - `MAX_CONCURRENT_UPLOADS`：最大并发上传数，默认 `16`
@@ -149,13 +150,13 @@ sudo ./deploy/install.sh --bin ./imgd
 - 端口
 - 存储目录
 - systemd 服务用户
-- token 等关键配置
+- 限流/并发等关键配置
 
 直接回车会使用默认值，其中端口默认是“随机可用四位数端口”。
 
 脚本会自动完成：
 - 创建/复用系统用户 `imgd`
-- 安装并配置 Nginx（可选）
+- 安装并配置 Nginx（可选，自动从 `nginx -V` 识别 prefix/conf-path，并写入已 include 的配置目录）
 - 安装二进制到 `/opt/imgd/bin/imgd`
 - 生成 `/opt/imgd/conf/imgd.env`
 - 创建 systemd 服务 `/etc/systemd/system/imgd.service`
@@ -168,7 +169,7 @@ sudo ./deploy/install.sh --bin ./imgd
 ```bash
 PORT=$(grep '^PORT=' /opt/imgd/conf/imgd.env | cut -d= -f2)
 curl -i "http://127.0.0.1:${PORT}/healthz"
-curl -i -H "X-Upload-Token: replace-with-long-random-token" \
+curl -i -H "X-Upload-Token: <your-token>" \
   -F "file=@/path/to/a.webp" \
   http://img.example.com/upload
 ```
@@ -179,7 +180,6 @@ curl -i -H "X-Upload-Token: replace-with-long-random-token" \
 # 自定义端口、数据目录、限流
 sudo ./deploy/install.sh \
   --domain img.example.com \
-  --token 'xxx' \
   --bin ./imgd \
   --port 3000 \
   --data-dir /data/images \
@@ -187,13 +187,13 @@ sudo ./deploy/install.sh \
   --rate-limit 60
 
 # 只部署后端，不改 Nginx
-sudo ./deploy/install.sh --domain img.example.com --token 'xxx' --bin ./imgd --skip-nginx
+sudo ./deploy/install.sh --domain img.example.com --bin ./imgd --skip-nginx
 
 # 仅写配置，不立即启动
-sudo ./deploy/install.sh --domain img.example.com --token 'xxx' --bin ./imgd --no-enable
+sudo ./deploy/install.sh --domain img.example.com --bin ./imgd --no-enable
 
 # 禁用交互（CI/脚本场景）
-sudo ./deploy/install.sh --non-interactive --domain img.example.com --token 'xxx' --bin ./imgd
+sudo ./deploy/install.sh --non-interactive --domain img.example.com --bin ./imgd
 ```
 
 ### 5) 更新版本

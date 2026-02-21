@@ -12,7 +12,7 @@ Interactive mode:
 
 Options:
   --domain <domain>            Public domain, e.g. img.example.com
-  --token <upload_token>       Upload token for API auth
+  --token <upload_token>       Optional legacy UPLOAD_TOKEN (not recommended)
   --bin <path>                 Binary path (default: ./imgd)
   --port <port>                Backend listen port (default: random free 4-digit)
   --data-dir <dir>             Image data dir (default: /data/images)
@@ -27,7 +27,6 @@ Options:
 Example:
   sudo ./deploy/install.sh \
     --domain img.example.com \
-    --token 'replace-with-long-random-token' \
     --bin ./imgd
 USAGE
 }
@@ -45,6 +44,24 @@ SKIP_NGINX="0"
 NO_ENABLE="0"
 INTERACTIVE="auto"
 EXISTING_ENV_FILE="/opt/imgd/conf/imgd.env"
+
+if [[ -t 1 ]]; then
+  C_BOLD="$(printf '\033[1m')"
+  C_BLUE="$(printf '\033[34m')"
+  C_YELLOW="$(printf '\033[33m')"
+  C_RED="$(printf '\033[31m')"
+  C_RESET="$(printf '\033[0m')"
+else
+  C_BOLD=""
+  C_BLUE=""
+  C_YELLOW=""
+  C_RED=""
+  C_RESET=""
+fi
+
+step() { echo "${C_BOLD}${C_BLUE}==>${C_RESET} $*"; }
+warn() { echo "${C_YELLOW}WARN:${C_RESET} $*"; }
+fail() { echo "${C_RED}ERROR:${C_RESET} $*" >&2; exit 1; }
 
 pick_random_port() {
   local p
@@ -75,14 +92,6 @@ port_is_free() {
   return 0
 }
 
-generate_token() {
-  if command -v openssl >/dev/null 2>&1; then
-    openssl rand -hex 24
-    return
-  fi
-  head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'
-}
-
 prompt_with_default() {
   local prompt="$1"
   local default="$2"
@@ -93,6 +102,70 @@ prompt_with_default() {
   else
     echo "$value"
   fi
+}
+
+discover_nginx_conf() {
+  local v conf_path prefix
+  v="$(nginx -V 2>&1 || true)"
+  conf_path="$(echo "$v" | sed -n 's/.*--conf-path=\([^ ]*\).*/\1/p')"
+  prefix="$(echo "$v" | sed -n 's/.*--prefix=\([^ ]*\).*/\1/p')"
+
+  if [[ -z "$conf_path" && -n "$prefix" ]]; then
+    conf_path="$prefix/conf/nginx.conf"
+  fi
+  if [[ -z "$conf_path" && -f /etc/nginx/nginx.conf ]]; then
+    conf_path="/etc/nginx/nginx.conf"
+  fi
+
+  [[ -n "$conf_path" ]] || return 1
+  [[ -f "$conf_path" ]] || return 1
+
+  NGINX_CONF_PATH="$conf_path"
+  NGINX_PREFIX="$prefix"
+  export NGINX_CONF_PATH NGINX_PREFIX
+  return 0
+}
+
+resolve_nginx_path() {
+  local p="$1"
+  local base
+  if [[ "$p" = /* ]]; then
+    echo "$p"
+    return 0
+  fi
+  if [[ -n "${NGINX_PREFIX:-}" ]]; then
+    base="$NGINX_PREFIX"
+  else
+    base="$(dirname "${NGINX_CONF_PATH}")"
+  fi
+  echo "${base%/}/$p"
+}
+
+pick_nginx_include_dir() {
+  local include raw abs dir best
+  best=""
+  while IFS= read -r raw; do
+    include="$(echo "$raw" | sed -E 's/^[[:space:]]*include[[:space:]]+([^;]+);[[:space:]]*$/\1/')"
+    include="$(resolve_nginx_path "$include")"
+    if [[ "$include" == *"*"* ]]; then
+      dir="${include%/*}"
+    else
+      dir="$(dirname "$include")"
+    fi
+    [[ -d "$dir" ]] || continue
+    case "$dir" in
+      *vhost*|*sites-enabled*|*conf.d*)
+        echo "$dir"
+        return 0
+        ;;
+      *)
+        [[ -z "$best" ]] && best="$dir"
+        ;;
+    esac
+  done < <(grep -E '^[[:space:]]*include[[:space:]]+[^;]+;' "$NGINX_CONF_PATH" || true)
+
+  [[ -n "$best" ]] && echo "$best" && return 0
+  return 1
 }
 
 while [[ $# -gt 0 ]]; do
@@ -140,18 +213,15 @@ fi
 
 SUGGESTED_PORT="$(pick_random_port)"
 DEFAULT_DOMAIN="$(hostname -f 2>/dev/null || hostname || echo img.local)"
-DEFAULT_TOKEN="$(generate_token)"
 
 if [[ -f "$EXISTING_ENV_FILE" ]]; then
   existing_port="$(grep -E '^PORT=' "$EXISTING_ENV_FILE" | head -n1 | cut -d= -f2- || true)"
-  existing_token="$(grep -E '^UPLOAD_TOKEN=' "$EXISTING_ENV_FILE" | head -n1 | cut -d= -f2- || true)"
   existing_data_dir="$(grep -E '^DATA_DIR=' "$EXISTING_ENV_FILE" | head -n1 | cut -d= -f2- || true)"
   existing_public_base_url="$(grep -E '^PUBLIC_BASE_URL=' "$EXISTING_ENV_FILE" | head -n1 | cut -d= -f2- || true)"
   existing_max_concurrent="$(grep -E '^MAX_CONCURRENT_UPLOADS=' "$EXISTING_ENV_FILE" | head -n1 | cut -d= -f2- || true)"
   existing_rate_limit="$(grep -E '^RATE_LIMIT_PER_MINUTE=' "$EXISTING_ENV_FILE" | head -n1 | cut -d= -f2- || true)"
 
   [[ -n "${existing_port}" ]] && PORT="${PORT:-$existing_port}"
-  [[ -n "${existing_token}" ]] && UPLOAD_TOKEN="${UPLOAD_TOKEN:-$existing_token}"
   [[ -n "${existing_data_dir}" ]] && DATA_DIR="${DATA_DIR:-$existing_data_dir}"
   [[ -n "${existing_public_base_url}" ]] && PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-$existing_public_base_url}"
   [[ -n "${existing_max_concurrent}" ]] && MAX_CONCURRENT_UPLOADS="${MAX_CONCURRENT_UPLOADS:-$existing_max_concurrent}"
@@ -165,7 +235,6 @@ if [[ "$INTERACTIVE" == "1" ]]; then
   SERVICE_USER="$(prompt_with_default "Service user" "$SERVICE_USER")"
   MAX_CONCURRENT_UPLOADS="$(prompt_with_default "Max concurrent uploads" "$MAX_CONCURRENT_UPLOADS")"
   RATE_LIMIT_PER_MINUTE="$(prompt_with_default "Rate limit per IP per minute" "$RATE_LIMIT_PER_MINUTE")"
-  UPLOAD_TOKEN="$(prompt_with_default "Upload token" "${UPLOAD_TOKEN:-$DEFAULT_TOKEN}")"
   PUBLIC_BASE_URL="$(prompt_with_default "PUBLIC_BASE_URL" "${PUBLIC_BASE_URL:-https://${DOMAIN}/images}")"
 fi
 
@@ -175,26 +244,24 @@ fi
 if [[ -z "$PORT" ]]; then
   PORT="$SUGGESTED_PORT"
 fi
-if [[ -z "$UPLOAD_TOKEN" ]]; then
-  UPLOAD_TOKEN="$DEFAULT_TOKEN"
-fi
 if [[ -z "$PUBLIC_BASE_URL" ]]; then
   PUBLIC_BASE_URL="https://${DOMAIN}/images"
 fi
 
 if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [[ "$PORT" -lt 1000 ]] || [[ "$PORT" -gt 65535 ]]; then
-  echo "Invalid --port: $PORT (expected 1000-65535)" >&2
-  exit 1
+  fail "Invalid --port: $PORT (expected 1000-65535)"
+fi
+
+if [[ "$DOMAIN" == "0.0.0.0" ]]; then
+  warn "Domain is 0.0.0.0. This is usually not externally reachable."
 fi
 
 if [[ $EUID -ne 0 ]]; then
-  echo "Please run as root (use sudo)." >&2
-  exit 1
+  fail "Please run as root (use sudo)."
 fi
 
 if [[ ! -f "$BIN_PATH" ]]; then
-  echo "Binary not found: $BIN_PATH" >&2
-  exit 1
+  fail "Binary not found: $BIN_PATH"
 fi
 
 if [[ ! -x "$BIN_PATH" ]]; then
@@ -202,8 +269,7 @@ if [[ ! -x "$BIN_PATH" ]]; then
 fi
 
 if ! command -v systemctl >/dev/null 2>&1; then
-  echo "systemd is required" >&2
-  exit 1
+  fail "systemd is required"
 fi
 
 if [[ "$INTERACTIVE" == "1" ]]; then
@@ -216,6 +282,7 @@ if [[ "$INTERACTIVE" == "1" ]]; then
   echo "  Public base URL:      $PUBLIC_BASE_URL"
   echo "  Max concurrent:       $MAX_CONCURRENT_UPLOADS"
   echo "  Rate limit/min:       $RATE_LIMIT_PER_MINUTE"
+  echo "  Legacy UPLOAD_TOKEN:  $([[ -n \"$UPLOAD_TOKEN\" ]] && echo set || echo unset)"
   echo "  Configure nginx:      $([[ \"$SKIP_NGINX\" == \"0\" ]] && echo yes || echo no)"
   echo "  Enable/start service: $([[ \"$NO_ENABLE\" == \"0\" ]] && echo yes || echo no)"
   echo ""
@@ -227,8 +294,10 @@ if [[ "$INTERACTIVE" == "1" ]]; then
 fi
 
 if [[ "$SKIP_NGINX" == "0" ]]; then
+  step "Checking nginx installation"
   if ! command -v nginx >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
+    step "Installing nginx"
     apt-get update
     apt-get install -y nginx
   fi
@@ -244,14 +313,16 @@ if getent group www-data >/dev/null 2>&1; then
 fi
 
 install -d -m 755 /opt/imgd/bin /opt/imgd/conf
+step "Installing imgd binary to /opt/imgd/bin/imgd"
 install -m 755 "$BIN_PATH" /opt/imgd/bin/imgd
 
+step "Preparing data directories under $DATA_DIR"
 install -d -m 2750 -o "$SERVICE_USER" -g "$STATIC_GROUP" "$DATA_DIR"
 install -d -m 700 -o "$SERVICE_USER" -g "$SERVICE_USER" "$DATA_DIR/.tmp"
 
+step "Writing runtime environment file"
 cat > /opt/imgd/conf/imgd.env <<ENV
 PORT=${PORT}
-UPLOAD_TOKEN=${UPLOAD_TOKEN}
 PUBLIC_BASE_URL=${PUBLIC_BASE_URL}
 DATA_DIR=${DATA_DIR}
 TOKENS_FILE=/opt/imgd/conf/tokens.json
@@ -259,9 +330,21 @@ MAX_CONCURRENT_UPLOADS=${MAX_CONCURRENT_UPLOADS}
 RATE_LIMIT_PER_MINUTE=${RATE_LIMIT_PER_MINUTE}
 RUST_LOG=imgd=info,tower_http=info
 ENV
+if [[ -n "$UPLOAD_TOKEN" ]]; then
+  echo "UPLOAD_TOKEN=${UPLOAD_TOKEN}" >> /opt/imgd/conf/imgd.env
+fi
 chmod 640 /opt/imgd/conf/imgd.env
 chown root:"$SERVICE_USER" /opt/imgd/conf/imgd.env
 
+TOKENS_FILE="/opt/imgd/conf/tokens.json"
+if [[ ! -f "$TOKENS_FILE" ]]; then
+  step "Initializing token store at $TOKENS_FILE"
+  echo '{"tokens":[]}' > "$TOKENS_FILE"
+  chmod 640 "$TOKENS_FILE"
+  chown root:"$SERVICE_USER" "$TOKENS_FILE"
+fi
+
+step "Writing systemd unit: /etc/systemd/system/imgd.service"
 cat > /etc/systemd/system/imgd.service <<SERVICE
 [Unit]
 Description=imgd upload service (axum)
@@ -290,7 +373,14 @@ WantedBy=multi-user.target
 SERVICE
 
 if [[ "$SKIP_NGINX" == "0" ]]; then
-  cat > /etc/nginx/sites-available/imgd.conf <<NGINX
+  step "Detecting nginx config paths"
+  discover_nginx_conf || fail "Cannot locate nginx.conf via nginx -V. Run with --skip-nginx and configure manually."
+  NGINX_INCLUDE_DIR="$(pick_nginx_include_dir || true)"
+  [[ -n "$NGINX_INCLUDE_DIR" ]] || fail "Cannot find included nginx config directory from $NGINX_CONF_PATH."
+  NGINX_CONFIG_PATH="${NGINX_INCLUDE_DIR%/}/imgd.conf"
+  step "Writing nginx server config to $NGINX_CONFIG_PATH"
+
+  cat > "$NGINX_CONFIG_PATH" <<NGINX
 server {
     listen 80;
     server_name ${DOMAIN};
@@ -339,25 +429,66 @@ server {
 }
 NGINX
 
-  ln -sf /etc/nginx/sites-available/imgd.conf /etc/nginx/sites-enabled/imgd.conf
+  step "Validating nginx config"
   nginx -t
 fi
 
+step "Reloading systemd daemon"
 systemctl daemon-reload
 
+tokens_count="$(grep -o '"token"[[:space:]]*:' "$TOKENS_FILE" | wc -l | tr -d ' ')"
+CREATED_TOKEN=""
+if [[ "${tokens_count}" == "0" && -z "$UPLOAD_TOKEN" ]]; then
+  echo ""
+  step "No token found. Creating initial token"
+  token_name="default"
+  token_days=""
+  token_rate=""
+  token_never="1"
+  if [[ "$INTERACTIVE" == "1" ]]; then
+    token_name="$(prompt_with_default "Token name" "default")"
+    read -r -p "Token expires in N days (empty = never): " token_days
+    token_rate="$(prompt_with_default "Per-token rate limit/min (empty = inherit-global)" "")"
+    if [[ -n "$token_days" ]]; then
+      token_never="0"
+    fi
+  fi
+
+  token_cmd=(/opt/imgd/bin/imgd token create --name "$token_name" --tokens-file "$TOKENS_FILE")
+  if [[ "$token_never" == "1" ]]; then
+    token_cmd+=(--never-expire)
+  else
+    token_cmd+=(--days "$token_days")
+  fi
+  if [[ -n "$token_rate" ]]; then
+    token_cmd+=(--rate-limit "$token_rate")
+  fi
+  token_output="$("${token_cmd[@]}")"
+  echo "$token_output"
+  CREATED_TOKEN="$(echo "$token_output" | awk -F': ' '/^token: /{print $2}' | tail -n1)"
+fi
+
 if [[ "$NO_ENABLE" == "0" ]]; then
+  step "Enabling and starting imgd service"
   systemctl enable --now imgd
   if [[ "$SKIP_NGINX" == "0" ]]; then
+    step "Reloading nginx"
     systemctl reload nginx
   fi
 fi
 
 echo ""
-echo "Deploy complete."
+echo "${C_BOLD}Deploy complete.${C_RESET}"
 echo "Service status:"
 systemctl status imgd --no-pager || true
 echo ""
 echo "Health check (local):"
 echo "  curl -i http://127.0.0.1:${PORT}/healthz"
 echo "Upload API:"
-echo "  curl -i -H \"X-Upload-Token: ${UPLOAD_TOKEN}\" -F \"file=@/path/to/a.webp\" http://${DOMAIN}/upload"
+if [[ -n "$CREATED_TOKEN" ]]; then
+  echo "  curl -i -H \"X-Upload-Token: ${CREATED_TOKEN}\" -F \"file=@/path/to/a.webp\" http://${DOMAIN}/upload"
+elif [[ -n "$UPLOAD_TOKEN" ]]; then
+  echo "  curl -i -H \"X-Upload-Token: ${UPLOAD_TOKEN}\" -F \"file=@/path/to/a.webp\" http://${DOMAIN}/upload"
+else
+  echo "  create token first: /opt/imgd/bin/imgd token create --name default --never-expire --tokens-file ${TOKENS_FILE}"
+fi
