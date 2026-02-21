@@ -56,23 +56,16 @@ jobs:
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: imgd-linux-amd64.zip
-          path: dist/${{ env.ARTIFACT_NAME }}.zip
+          name: imgd-linux-amd64
+          path: dist/${{ env.ARTIFACT_NAME }}
           if-no-files-found: error
-
-      - name: Move latest tag to current main commit
-        if: github.ref == 'refs/heads/main'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -f latest
-          git push origin refs/tags/latest --force
 
       - name: Publish latest prerelease (main)
         if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
+          target_commitish: main
           name: Latest Build
           prerelease: true
           files: dist/${{ env.ARTIFACT_NAME }}.zip

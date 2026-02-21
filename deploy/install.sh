@@ -142,9 +142,37 @@ resolve_nginx_path() {
 }
 
 pick_nginx_include_dir() {
-  local include raw abs dir best
+  local include raw dir best http_includes
   best=""
+  http_includes="$(awk '
+    BEGIN { in_http=0; depth=0 }
+    function count_char(str, ch,   i, n, c) {
+      n=0
+      for (i=1; i<=length(str); i++) if (substr(str,i,1)==ch) n++
+      return n
+    }
+    {
+      line=$0
+      if (!in_http && line ~ /^[[:space:]]*http[[:space:]]*\{/) {
+        in_http=1
+        depth=1
+        next
+      }
+      if (in_http) {
+        if (line ~ /^[[:space:]]*include[[:space:]]+[^;]+;/) print line
+        depth += count_char(line, "{")
+        depth -= count_char(line, "}")
+        if (depth <= 0) in_http=0
+      }
+    }
+  ' "$NGINX_CONF_PATH")"
+
+  if [[ -z "$http_includes" ]]; then
+    http_includes="$(grep -E '^[[:space:]]*include[[:space:]]+[^;]+;' "$NGINX_CONF_PATH" || true)"
+  fi
+
   while IFS= read -r raw; do
+    [[ -z "$raw" ]] && continue
     include="$(echo "$raw" | sed -E 's/^[[:space:]]*include[[:space:]]+([^;]+);[[:space:]]*$/\1/')"
     include="$(resolve_nginx_path "$include")"
     if [[ "$include" == *"*"* ]]; then
@@ -154,6 +182,11 @@ pick_nginx_include_dir() {
     fi
     [[ -d "$dir" ]] || continue
     case "$dir" in
+      */tcp*|*/stream*)
+        continue
+        ;;
+    esac
+    case "$dir" in
       *vhost*|*sites-enabled*|*conf.d*)
         echo "$dir"
         return 0
@@ -162,7 +195,7 @@ pick_nginx_include_dir() {
         [[ -z "$best" ]] && best="$dir"
         ;;
     esac
-  done < <(grep -E '^[[:space:]]*include[[:space:]]+[^;]+;' "$NGINX_CONF_PATH" || true)
+  done <<< "$http_includes"
 
   [[ -n "$best" ]] && echo "$best" && return 0
   return 1
