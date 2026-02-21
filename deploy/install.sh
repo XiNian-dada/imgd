@@ -63,6 +63,39 @@ step() { echo "${C_BOLD}${C_BLUE}==>${C_RESET} $*"; }
 warn() { echo "${C_YELLOW}WARN:${C_RESET} $*"; }
 fail() { echo "${C_RED}ERROR:${C_RESET} $*" >&2; exit 1; }
 
+cleanup_legacy_nginx_imgd() {
+  local p
+  for p in \
+    /www/server/panel/vhost/nginx/tcp/imgd.conf \
+    /www/server/panel/vhost/nginx/stream/imgd.conf
+  do
+    if [[ -f "$p" ]]; then
+      if grep -q "location /upload" "$p" 2>/dev/null; then
+        warn "Removing legacy misplaced imgd nginx config: $p"
+        rm -f "$p"
+      fi
+    fi
+  done
+}
+
+validate_nginx_or_fix_legacy() {
+  local out
+  if nginx -t; then
+    return 0
+  fi
+
+  out="$(nginx -t 2>&1 || true)"
+  if echo "$out" | grep -qE 'sendfile.+not allowed here.+/tcp/imgd\.conf'; then
+    warn "Detected legacy tcp/imgd.conf conflict. Cleaning and retrying."
+    cleanup_legacy_nginx_imgd
+    nginx -t
+    return 0
+  fi
+
+  echo "$out" >&2
+  return 1
+}
+
 pick_random_port() {
   local p
   for _ in $(seq 1 200); do
@@ -414,6 +447,7 @@ if [[ "$SKIP_NGINX" == "0" ]]; then
   step "Writing nginx server config to $NGINX_CONFIG_PATH"
 
   cat > "$NGINX_CONFIG_PATH" <<NGINX
+# managed-by: imgd install.sh
 server {
     listen 80;
     server_name ${DOMAIN};
@@ -459,11 +493,11 @@ server {
         deny all;
         proxy_pass http://127.0.0.1:${PORT}/metrics;
     }
-}
+  }
 NGINX
 
   step "Validating nginx config"
-  nginx -t
+  validate_nginx_or_fix_legacy || fail "nginx config test failed"
 fi
 
 step "Reloading systemd daemon"

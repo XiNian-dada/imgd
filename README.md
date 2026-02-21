@@ -127,6 +127,10 @@ seq 1 100 | xargs -P 32 -I{} \
 
 已提供一键脚本：`deploy/install.sh`（交互式）。
 
+CI 产物说明：
+- Actions 工件名称：`imgd-linux-amd64.zip`（下载后可直接解压，内含 `imgd` 和 `install.sh`）
+- Release 资产名称：`imgd-linux-amd64.zip`（`main` 更新 `latest`，`v*` tag 发布正式版）
+
 ### 1) 准备文件（在服务器上）
 
 确保服务器上有这两个文件：
