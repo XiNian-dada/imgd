@@ -1,0 +1,67 @@
+name: Build Linux amd64 Package
+
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      CARGO_TERM_COLOR: always
+      BIN_NAME: imgd
+      ARTIFACT_NAME: imgd-linux-amd64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify runner architecture
+        run: |
+          uname -a
+          test "$(uname -m)" = "x86_64"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary (linux amd64)
+        run: cargo build --release --locked
+
+      - name: Prepare package files
+        run: |
+          rm -rf dist
+          mkdir -p dist/${ARTIFACT_NAME}
+          cp target/release/${BIN_NAME} dist/${ARTIFACT_NAME}/imgd
+          cp deploy/install.sh dist/${ARTIFACT_NAME}/install.sh
+          chmod +x dist/${ARTIFACT_NAME}/imgd
+          chmod +x dist/${ARTIFACT_NAME}/install.sh
+          file dist/${ARTIFACT_NAME}/imgd
+
+      - name: Create zip package
+        run: |
+          cd dist
+          zip -r ${ARTIFACT_NAME}.zip ${ARTIFACT_NAME}
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: imgd-linux-amd64-zip
+          path: dist/${{ env.ARTIFACT_NAME }}.zip
+          if-no-files-found: error
+
+      - name: Attach zip to GitHub Release (tag only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ env.ARTIFACT_NAME }}.zip

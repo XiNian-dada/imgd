@@ -1,12 +1,13 @@
 pub mod auth;
 pub mod config;
 pub mod error;
+pub mod token;
 pub mod upload;
 pub mod webp;
 
 use std::{
     collections::{HashMap, VecDeque},
-    net::{IpAddr, SocketAddr},
+    net::SocketAddr,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -27,13 +28,17 @@ use tower_http::{
     trace::TraceLayer,
 };
 
-use crate::{auth::auth_middleware, config::AppConfig, error::AppError, upload::upload_handler};
+use crate::{
+    auth::auth_middleware, config::AppConfig, error::AppError, token::AuthorizedToken,
+    upload::upload_handler,
+};
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: AppConfig,
     pub upload_semaphore: Arc<Semaphore>,
     pub rate_limiter: SimpleRateLimiter,
+    pub token_store: crate::token::TokenStore,
     pub metrics: Arc<Metrics>,
 }
 
@@ -46,24 +51,22 @@ pub struct Metrics {
 
 #[derive(Clone)]
 pub struct SimpleRateLimiter {
-    max_requests: usize,
     window: Duration,
-    inner: Arc<Mutex<HashMap<IpAddr, VecDeque<Instant>>>>,
+    inner: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
 }
 
 impl SimpleRateLimiter {
-    pub fn new(max_requests: usize, window: Duration) -> Self {
+    pub fn new(window: Duration) -> Self {
         Self {
-            max_requests,
             window,
             inner: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    pub fn check(&self, ip: IpAddr) -> bool {
+    pub fn check(&self, key: String, max_requests: usize) -> bool {
         let mut guard = self.inner.lock().expect("rate limiter poisoned");
         let now = Instant::now();
-        let queue = guard.entry(ip).or_default();
+        let queue = guard.entry(key).or_default();
 
         while let Some(front) = queue.front() {
             if now.duration_since(*front) > self.window {
@@ -73,7 +76,7 @@ impl SimpleRateLimiter {
             }
         }
 
-        if queue.len() >= self.max_requests {
+        if queue.len() >= max_requests {
             return false;
         }
 
@@ -158,21 +161,39 @@ async fn rate_limit_middleware(
     next: middleware::Next,
 ) -> Response {
     let ip = extract_ip(&req);
-    if !state.rate_limiter.check(ip) {
+    if !state
+        .rate_limiter
+        .check(format!("ip:{ip}"), state.config.rate_limit_per_minute)
+    {
         state
             .metrics
             .upload_limited
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return AppError::TooManyRequests.into_response();
     }
+
+    if let Some(auth) = req.extensions().get::<AuthorizedToken>() {
+        if let Some(per_token_limit) = auth.rate_limit_per_minute {
+            if !state
+                .rate_limiter
+                .check(format!("token:{}", auth.token_id), per_token_limit)
+            {
+                state
+                    .metrics
+                    .upload_limited
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return AppError::TooManyRequests.into_response();
+            }
+        }
+    }
     next.run(req).await
 }
 
-pub fn extract_ip(req: &Request<Body>) -> IpAddr {
+pub fn extract_ip(req: &Request<Body>) -> std::net::IpAddr {
     if let Some(raw) = req.headers().get("x-forwarded-for") {
         if let Ok(v) = raw.to_str() {
             if let Some(first) = v.split(',').next() {
-                if let Ok(ip) = first.trim().parse::<IpAddr>() {
+                if let Ok(ip) = first.trim().parse::<std::net::IpAddr>() {
                     return ip;
                 }
             }
@@ -183,5 +204,5 @@ pub fn extract_ip(req: &Request<Body>) -> IpAddr {
         return addr.ip();
     }
 
-    IpAddr::from([127, 0, 0, 1])
+    std::net::IpAddr::from([127, 0, 0, 1])
 }

@@ -6,7 +6,7 @@ use axum::{
     http::{header, Request, StatusCode},
 };
 use http_body_util::BodyExt;
-use imgd::{build_app, config::AppConfig, AppState, Metrics, SimpleRateLimiter};
+use imgd::{build_app, config::AppConfig, token::TokenStore, AppState, Metrics, SimpleRateLimiter};
 use serde_json::Value;
 use tokio::sync::Semaphore;
 use tower::ServiceExt;
@@ -15,7 +15,8 @@ fn make_test_state(data_dir: &std::path::Path) -> AppState {
     AppState {
         config: AppConfig {
             bind_addr: "127.0.0.1:0".parse().expect("addr"),
-            upload_token: "secret".to_string(),
+            upload_token: Some("secret".to_string()),
+            tokens_file: None,
             public_base_url: "https://img.example.com/images".to_string(),
             data_dir: data_dir.to_path_buf(),
             max_upload_bytes: 5 * 1024 * 1024,
@@ -23,7 +24,18 @@ fn make_test_state(data_dir: &std::path::Path) -> AppState {
             rate_limit_per_minute: 100,
         },
         upload_semaphore: Arc::new(Semaphore::new(4)),
-        rate_limiter: SimpleRateLimiter::new(100, Duration::from_secs(60)),
+        rate_limiter: SimpleRateLimiter::new(Duration::from_secs(60)),
+        token_store: TokenStore::from_config(&AppConfig {
+            bind_addr: "127.0.0.1:0".parse().expect("addr"),
+            upload_token: Some("secret".to_string()),
+            tokens_file: None,
+            public_base_url: "https://img.example.com/images".to_string(),
+            data_dir: data_dir.to_path_buf(),
+            max_upload_bytes: 5 * 1024 * 1024,
+            max_concurrent_uploads: 4,
+            rate_limit_per_minute: 100,
+        })
+        .expect("token store"),
         metrics: Arc::new(Metrics::default()),
     }
 }

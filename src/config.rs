@@ -3,7 +3,8 @@ use std::{env, fs, net::SocketAddr, path::PathBuf};
 #[derive(Clone)]
 pub struct AppConfig {
     pub bind_addr: SocketAddr,
-    pub upload_token: String,
+    pub upload_token: Option<String>,
+    pub tokens_file: Option<PathBuf>,
     pub public_base_url: String,
     pub data_dir: PathBuf,
     pub max_upload_bytes: usize,
@@ -16,13 +17,19 @@ impl AppConfig {
         let port = env::var("PORT").unwrap_or_else(|_| "3000".to_owned());
         let bind_addr: SocketAddr = format!("0.0.0.0:{port}").parse()?;
 
-        let upload_token = env::var("UPLOAD_TOKEN")?;
+        let upload_token = env::var("UPLOAD_TOKEN").ok();
+        let tokens_file = env::var("TOKENS_FILE").ok().map(PathBuf::from);
         let public_base_url = env::var("PUBLIC_BASE_URL")?;
         let data_dir = env::var("DATA_DIR").unwrap_or_else(|_| "/data/images".to_owned());
+
+        if upload_token.is_none() && tokens_file.is_none() {
+            return Err("UPLOAD_TOKEN or TOKENS_FILE must be set".into());
+        }
 
         Ok(Self {
             bind_addr,
             upload_token,
+            tokens_file,
             public_base_url,
             data_dir: PathBuf::from(data_dir),
             max_upload_bytes: 5 * 1024 * 1024,

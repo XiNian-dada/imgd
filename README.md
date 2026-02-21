@@ -120,33 +120,119 @@ seq 1 100 | xargs -P 32 -I{} \
   http://127.0.0.1:3000/upload | sort | uniq -c
 ```
 
-## Nginx 配置
+## 生产部署（Ubuntu x86_64）
 
-示例文件：`deploy/nginx/imgd.conf`
+你说得对，部署应该是“二进制到服务器后，全在服务器执行”。
 
-关键点：
-- `location /images/ { alias /data/images/; }`
-- `autoindex off`
-- 强缓存：`Cache-Control: public, max-age=31536000, immutable`
-- `sendfile on`
-- `open_file_cache` 提升静态性能
-- 开启 `etag on`
+已提供一键脚本：`deploy/install.sh`（交互式）。
 
-## systemd 配置
+### 1) 准备文件（在服务器上）
 
-示例文件：`deploy/systemd/imgd.service`
+确保服务器上有这两个文件：
+- `imgd`（Linux x86_64 二进制）
+- `deploy/install.sh`
 
-关键点：
-- 独立用户运行：`User=imgd`
-- 自动重启：`Restart=always`
-- 环境变量注入：`PORT/UPLOAD_TOKEN/PUBLIC_BASE_URL/DATA_DIR`
-- `ReadWritePaths=/data/images` 限制写入范围
+给执行权限：
 
-## 权限建议
+```bash
+chmod +x ./imgd ./deploy/install.sh
+```
 
-- Rust 服务用户 `imgd`：对 `/data/images` 有写权限
-- Nginx：对 `/data/images` 只有读权限
-- 临时文件目录：`/data/images/.tmp`（建议 `750`）
+### 2) 一键部署（在服务器上）
+
+```bash
+sudo ./deploy/install.sh --bin ./imgd
+```
+
+脚本会逐项询问：
+- 域名
+- 端口
+- 存储目录
+- systemd 服务用户
+- token 等关键配置
+
+直接回车会使用默认值，其中端口默认是“随机可用四位数端口”。
+
+脚本会自动完成：
+- 创建/复用系统用户 `imgd`
+- 安装并配置 Nginx（可选）
+- 安装二进制到 `/opt/imgd/bin/imgd`
+- 生成 `/opt/imgd/conf/imgd.env`
+- 创建 systemd 服务 `/etc/systemd/system/imgd.service`
+- 创建静态目录 `/data/images` 与临时目录 `/data/images/.tmp`
+- 启动并设置开机自启 `imgd`
+- 重载 Nginx
+
+### 3) 验收
+
+```bash
+PORT=$(grep '^PORT=' /opt/imgd/conf/imgd.env | cut -d= -f2)
+curl -i "http://127.0.0.1:${PORT}/healthz"
+curl -i -H "X-Upload-Token: replace-with-long-random-token" \
+  -F "file=@/path/to/a.webp" \
+  http://img.example.com/upload
+```
+
+### 4) 常用参数
+
+```bash
+# 自定义端口、数据目录、限流
+sudo ./deploy/install.sh \
+  --domain img.example.com \
+  --token 'xxx' \
+  --bin ./imgd \
+  --port 3000 \
+  --data-dir /data/images \
+  --max-concurrent 16 \
+  --rate-limit 60
+
+# 只部署后端，不改 Nginx
+sudo ./deploy/install.sh --domain img.example.com --token 'xxx' --bin ./imgd --skip-nginx
+
+# 仅写配置，不立即启动
+sudo ./deploy/install.sh --domain img.example.com --token 'xxx' --bin ./imgd --no-enable
+
+# 禁用交互（CI/脚本场景）
+sudo ./deploy/install.sh --non-interactive --domain img.example.com --token 'xxx' --bin ./imgd
+```
+
+### 5) 更新版本
+
+把新二进制覆盖到服务器后，重复执行同一条安装命令即可（幂等）。
+
+### 6) 日志与状态
+
+```bash
+sudo systemctl status imgd --no-pager
+sudo journalctl -u imgd -f
+```
+
+### 7) Token 管理（新增）
+
+服务支持通过命令生成多个 token，并可单独控制过期时间与频率限制。
+
+```bash
+# 生成一个 token：30 天过期，每分钟最多 120 次上传
+/opt/imgd/bin/imgd token create --name mobile --days 30 --rate-limit 120 --tokens-file /opt/imgd/conf/tokens.json
+
+# 生成一个永不过期 token（不设独立限流，继承全局 RATE_LIMIT_PER_MINUTE）
+/opt/imgd/bin/imgd token create --name ci --never-expire --tokens-file /opt/imgd/conf/tokens.json
+
+# 按 RFC3339 指定过期时间
+/opt/imgd/bin/imgd token create --name temp --expires-at 2026-12-31T23:59:59Z --rate-limit 30 --tokens-file /opt/imgd/conf/tokens.json
+
+# 查看 token（展示 name/过期/限流/token_id，不直接泄露 token）
+/opt/imgd/bin/imgd token list --tokens-file /opt/imgd/conf/tokens.json
+
+# 撤销 token（按 name 或原始 token）
+/opt/imgd/bin/imgd token revoke --name mobile --tokens-file /opt/imgd/conf/tokens.json
+```
+
+修改 token 后重启服务生效：
+
+```bash
+sudo systemctl restart imgd
+```
 
 ## 国内 crates 镜像（已配置清华源）
 

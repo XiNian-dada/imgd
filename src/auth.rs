@@ -6,27 +6,30 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use crate::{error::AppError, AppState};
+use crate::{error::AppError, token::AuthorizedToken, AppState};
 
 pub async fn auth_middleware(
     State(state): State<AppState>,
-    req: Request<Body>,
+    mut req: Request<Body>,
     next: middleware::Next,
 ) -> Response {
-    if is_authorized(req.headers(), &state.config.upload_token) {
-        return next.run(req).await;
+    if let Some(raw_token) = extract_token(req.headers()) {
+        if let Some(authorized) = state.token_store.authorize(&raw_token) {
+            req.extensions_mut().insert::<AuthorizedToken>(authorized);
+            return next.run(req).await;
+        }
     }
 
     AppError::Unauthorized.into_response()
 }
 
-pub fn is_authorized(headers: &HeaderMap, expected_token: &str) -> bool {
+pub fn extract_token(headers: &HeaderMap) -> Option<String> {
     if let Some(token) = headers
         .get("x-upload-token")
         .and_then(|v| v.to_str().ok())
         .filter(|v| !v.is_empty())
     {
-        return token == expected_token;
+        return Some(token.to_owned());
     }
 
     if let Some(value) = headers
@@ -35,10 +38,19 @@ pub fn is_authorized(headers: &HeaderMap, expected_token: &str) -> bool {
         .filter(|v| !v.is_empty())
     {
         if let Some(token) = value.strip_prefix("Bearer ") {
-            return token == expected_token;
+            if !token.is_empty() {
+                return Some(token.to_owned());
+            }
         }
     }
 
+    None
+}
+
+pub fn is_authorized(headers: &HeaderMap, expected_token: &str) -> bool {
+    if let Some(raw) = extract_token(headers) {
+        return raw == expected_token;
+    }
     false
 }
 
